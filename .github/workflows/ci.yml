@@ -1,0 +1,132 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Run terraform apply + ansible deploy"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  TF_DIR: terraform
+  AWS_REGION: eu-west-1
+
+jobs:
+  lint:
+    name: Lint & validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+      - run: terraform -chdir=$TF_DIR fmt -check -recursive
+      - run: terraform -chdir=$TF_DIR init -backend=false
+      - run: terraform -chdir=$TF_DIR validate
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ansible ansible-lint
+      - run: ansible-lint ansible/playbook.yml
+
+  security:
+    name: Security scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Secret scan (gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: IaC misconfiguration scan (Trivy)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: config
+          scan-ref: terraform
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          format: sarif
+          output: trivy.sarif
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+      - name: Checkov (Terraform + Ansible)
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: .
+          framework: terraform,ansible
+          quiet: true
+
+  plan:
+    name: Terraform plan
+    needs: [lint, security]
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - run: terraform -chdir=$TF_DIR init
+      - run: terraform -chdir=$TF_DIR plan -out=tfplan -input=false
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: terraform/tfplan
+
+  deploy:
+    name: Apply & configure
+    needs: plan
+    if: github.event_name == 'workflow_dispatch' && inputs.apply
+    runs-on: ubuntu-latest
+    environment: production   # add required reviewers in repo settings
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+          terraform_wrapper: false
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: terraform
+      - run: |
+          terraform -chdir=$TF_DIR init
+          terraform -chdir=$TF_DIR apply -input=false tfplan
+          echo "HOST_IP=$(terraform -chdir=$TF_DIR output -raw public_ip)" >> "$GITHUB_ENV"
+      - name: Configure SSH
+        run: |
+          install -m 700 -d ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$HOST_IP" >> ~/.ssh/known_hosts
+      - run: pip install ansible
+      - run: ansible-playbook -i "$HOST_IP," -u ubuntu ansible/playbook.yml

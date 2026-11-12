@@ -1,0 +1,60 @@
+---
+- name: Deploy Prometheus + Grafana stack
+  hosts: all
+  become: true
+  vars:
+    stack_dir: /opt/monitoring
+  tasks:
+    - name: Install Docker and compose plugin
+      ansible.builtin.apt:
+        name: [docker.io, docker-compose-v2]
+        state: present
+        update_cache: true
+
+    - name: Ensure Docker is running
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Create stack directories
+      ansible.builtin.file:
+        path: "{{ stack_dir }}/{{ item }}"
+        state: directory
+        mode: "0755"
+        owner: root
+        group: root
+      loop:
+        - ""
+        - grafana/provisioning/datasources
+        - grafana/provisioning/dashboards
+        - grafana/dashboards
+
+    - name: Template compose and Prometheus config
+      ansible.builtin.template:
+        src: "{{ item.src }}"
+        dest: "{{ stack_dir }}/{{ item.dest }}"
+        mode: "0644"
+        owner: root
+        group: root
+      loop:
+        - { src: docker-compose.yml.j2, dest: docker-compose.yml }
+        - { src: prometheus.yml.j2, dest: prometheus.yml }
+
+    - name: Copy Grafana provisioning and dashboards
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../grafana/{{ item }}"
+        dest: "{{ stack_dir }}/grafana/{{ item }}"
+        mode: "0644"
+        owner: root
+        group: root
+      loop:
+        - provisioning/datasources/prometheus.yml
+        - provisioning/dashboards/dashboards.yml
+        - dashboards/infra-overview.json
+
+    - name: Start the stack
+      ansible.builtin.command:
+        cmd: docker compose up -d
+        chdir: "{{ stack_dir }}"
+      changed_when: true
